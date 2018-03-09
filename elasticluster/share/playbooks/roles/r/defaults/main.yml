@@ -4,13 +4,16 @@
 # list of additional (non-core) libraries to install
 r_libraries:
    - devtools  # allow installing packages directly from GitHub
+   - raster
+   - ranger
+   - rgdal
 
 # a full list of commonly-used and recommended R packages;
 # see: https://support.rstudio.com/hc/en-us/articles/201057987-Quick-list-of-useful-R-packages
 #
 # r_libraries:
-#   # to manipulate data
-#   - dplyr # dplyr is our go to package for fast data manipulation.
+#   - devtools  # allow installing packages directly from GitHub
+#   - doSNOW
 #   - tidyr # Tools for changing the layout of your data sets. Use the gather and spread functions to convert your data into the tidy format, the layout R likes best.
 #   - stringr # Easy to learn tools for regular expressions and character strings.
 #   - lubridate # Tools that make working with dates and times easier.

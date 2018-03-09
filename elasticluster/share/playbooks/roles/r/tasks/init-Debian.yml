@@ -39,6 +39,10 @@
       # more dependency packages, notes from CSCS' workshop on Spark
       - libssl-dev
       - libcurl4-openssl-dev
+      # Dependencies for rgdal
+      - gdal-bin
+      - libgdal-dev
+      - libproj-dev
     r_packages_repo: 'deb {{r_cran_mirror_url}}/bin/linux/debian {{ansible_distribution_release}}-cran3/'
     r_packages_keyserver: keys.gnupg.net
     r_packages_signing_key: '6212B7B7931C4BB16280BA1306F90DE5381BA480'
