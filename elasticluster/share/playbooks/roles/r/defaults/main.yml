@@ -7,6 +7,7 @@ r_libraries:
    - raster
    - ranger
    - rgdal
+   - gdalUtils
 
 # a full list of commonly-used and recommended R packages;
 # see: https://support.rstudio.com/hc/en-us/articles/201057987-Quick-list-of-useful-R-packages
