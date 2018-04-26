@@ -55,7 +55,7 @@ from elasticluster.exceptions import ImageError, InstanceError, InstanceNotFound
 GCE_SCOPE = 'https://www.googleapis.com/auth/compute'
 GCE_API_NAME = 'compute'
 GCE_API_VERSION = 'v1'
-GCE_URL = 'https://www.googleapis.com/compute/%s/projects/' % GCE_API_VERSION
+GCE_URL = ('https://www.googleapis.com/compute/%s/projects/' % GCE_API_VERSION)
 GCE_DEFAULT_ZONE = 'us-central1-a'
 GCE_DEFAULT_SERVICE_EMAIL = 'default'
 GCE_DEFAULT_SCOPES = ['https://www.googleapis.com/auth/devstorage'
@@ -207,6 +207,48 @@ class GoogleCloudProvider(AbstractCloudProvider):
                 status = response['status']
         return response
 
+
+    # This list can be regenerated or updated by running::
+    #
+    #     $ gcloud compute images list \
+    #           | perl -e 'while(<STDIN>) { \
+    #               chomp; \
+    #               my ($name, $cloud, $ignore1, $ignore2) = split; \
+    #               my @parts = split (/-/, $name); \
+    #               print "$parts[0] $cloud\n"; \
+    #             }' \
+    #           | sort -u
+    #
+    IMAGE_NAME_SHORTCUTS = {
+        # image prefix       project name
+        # =================  ================
+        'backports-debian': 'debian-cloud',
+        'centos':           'centos-cloud',
+        'container-vm':     'google-containers',
+        'coreos':           'coreos-cloud',
+        'cos':              'cos-cloud',
+        'debian':           'debian-cloud',
+        'rhel':             'rhel-cloud',
+        #'rhel':             'rhel-sap-cloud',
+        'sles':             'suse-cloud',
+        #'sles':             'suse-sap-cloud',
+        #'sql':              'windows-sql-cloud',
+        'ubuntu':           'ubuntu-os-cloud',
+        #'windows':          'windows-cloud',
+    }
+    """
+    Map image names to projects, based on prefix.
+
+    The image names and full resource URLs for several Google-
+    provided images (debian, centos, etc.) follow a consistent
+    pattern, and so ElastiCluster supports a short-hand of just
+    an image name, such as::
+
+      "debian-7-wheezy-v20150526
+
+    The cloud project in this case is then ``debian-cloud``.
+    """
+
     def start_instance(self,
                        # these are common to any
                        # CloudProvider.start_instance() call
@@ -273,30 +315,17 @@ class GoogleCloudProvider(AbstractCloudProvider):
         if image_id.startswith('http://') or image_id.startswith('https://'):
             image_url = image_id
         else:
-            # The image names and full resource URLs for several Google-
-            # provided images (debian, centos, etc.) follow a consistent
-            # pattern, and so elasticluster supports a short-hand of just
-            # an image name, such as
-            #   "debian-7-wheezy-v20150526".
-            # The cloud project in this case is then "debian-cloud".
-            #
-            # Several images do not follow this convention, and so are
-            # special-cased here:
-            #   backports-debian -> debian-cloud
-            #   ubuntu           -> ubuntu-os-cloud
-            #   containter-vm    -> google-containers
-            if image_id.startswith('container-vm-'):
-              os_cloud = 'google-containers'
-            elif image_id.startswith('backports-debian-'):
-              os_cloud = 'debian-cloud'
-            elif image_id.startswith('ubuntu-'):
-              os_cloud = 'ubuntu-os-cloud'
+            # allow image shortcuts (see docstring for IMAGE_NAME_SHORTCUTS)
+            for prefix, os_cloud in self.IMAGE_NAME_SHORTCUTS.iteritems():
+                if image_id.startswith(prefix + '-'):
+                    image_url = '%s%s/global/images/%s' % (
+                        GCE_URL, os_cloud, image_id)
+                    break
             else:
-              os = image_id.split("-")[0]
-              os_cloud = "%s-cloud" % os
-
-            image_url = '%s%s/global/images/%s' % (
-                GCE_URL, os_cloud, image_id)
+                raise InstanceError(
+                    "Unknown image name shortcut '{0}',"
+                    " please use the full `https://...` self-link URL."
+                    .format(image_id))
 
         scheduling_option = {}
         if scheduling == 'preemptible':
@@ -315,14 +344,30 @@ class GoogleCloudProvider(AbstractCloudProvider):
                 " should be a string or a list, got {T} instead"
                 .format(T=type(tags)))
 
+        with open(public_key_path, 'r') as f:
+            public_key_content = f.read()
+
+        compute_metadata = [
+            {
+                "key": "ssh-keys",
+                "value": "%s:%s" % (username, public_key_content),
+            },
+            {
+                "key": "block-project-ssh-keys",
+                "value": (not allow_project_ssh_keys),
+            },
+        ]
+        if image_userdata:
+            compute_metadata.append({
+                "key": "startup-script",
+                "value": image_userdata,
+            })
+
         # construct the request body
         if node_name:
             instance_id = node_name.lower().replace('_', '-')  # GCE doesn't allow "_"
         else:
             instance_id = 'elasticluster-%s' % uuid.uuid4()
-
-        with open(public_key_path, 'r') as f:
-            public_key_content = f.read()
 
         instance = {
             'name': instance_id,
@@ -339,7 +384,7 @@ class GoogleCloudProvider(AbstractCloudProvider):
                     'diskName': "%s-disk" % instance_id,
                     'diskType': boot_disk_type_url,
                     'diskSizeGb': boot_disk_size_gb,
-                    'sourceImage': image_url
+                    'sourceImage': image_url,
                     }
                 }],
             'networkInterfaces': [
@@ -355,16 +400,7 @@ class GoogleCloudProvider(AbstractCloudProvider):
                 }],
             "metadata": {
                 "kind": "compute#metadata",
-                "items": [
-                    {
-                        "key": "ssh-keys",
-                        "value": "%s:%s" % (username, public_key_content),
-                    },
-                    {
-                        "key": "block-project-ssh-keys",
-                        "value": (not allow_project_ssh_keys),
-                    },
-                ]
+                "items": compute_metadata,
             }
         }
 
@@ -527,29 +563,6 @@ class GoogleCloudProvider(AbstractCloudProvider):
             if item['status'] == 'RUNNING':
                 return True
         return False
-
-    def _get_image_url(self, image_id):
-        """Gets the url for the specified image. Unfortunatly this only works
-        for images uploaded by the user. The images provided by google will
-        not be found.
-
-        :param str image_id: image identifier
-        :return: str - api url of the image
-        """
-        gce = self._connect()
-        filter = "name eq %s" % image_id
-        request = gce.images().list(project=self._project_id, filter=filter)
-        response = self._execute_request(request)
-        response = self._wait_until_done(response)
-
-        image_url = None
-        if "items" in response:
-            image_url = response["items"][0]["selfLink"]
-
-        if image_url:
-            return image_url
-        else:
-            raise ImageError("Could not find given image id `%s`" % image_id)
 
     def _check_response(self, response):
         """Checks the response from GCE for error messages.

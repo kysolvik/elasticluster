@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2013, 2015 S3IT, University of Zurich
+# Copyright (C) 2013-2018 University of Zurich
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -41,9 +41,9 @@ from pkg_resources import resource_filename
 # Elasticluster imports
 import elasticluster
 from elasticluster import log
-from elasticluster.exceptions import ConfigurationError
+from elasticluster.exceptions import ConfigurationError, ClusterSizeError
 from elasticluster.providers import AbstractSetupProvider
-from elasticluster.utils import parse_ip_address_and_port
+from elasticluster.utils import parse_ip_address_and_port, temporary_dir
 
 
 class AnsibleSetupProvider(AbstractSetupProvider):
@@ -165,11 +165,9 @@ class AnsibleSetupProvider(AbstractSetupProvider):
         """
         inventory_path = self._build_inventory(cluster)
         if inventory_path is None:
-            # No inventory file has been created, maybe an
-            # invalid class has been specified in config file? Or none?
-            # assume it is fine.
-            elasticluster.log.info("No setup required for this cluster.")
-            return True
+            # no inventory file has been created: this can only happen
+            # if no nodes have been started nor can be reached
+            raise ClusterSizeError()
         assert os.path.exists(inventory_path), (
                 "inventory file `{inventory_path}` does not exist"
                 .format(inventory_path=inventory_path))
@@ -209,17 +207,47 @@ class AnsibleSetupProvider(AbstractSetupProvider):
         ansible_env = {
             'ANSIBLE_FORKS':             '10',
             'ANSIBLE_HOST_KEY_CHECKING': 'no',
-            'ANSIBLE_PRIVATE_KEY_FILE':  cluster.user_key_private,
+            'ANSIBLE_RETRY_FILES_ENABLED': 'no',
             'ANSIBLE_ROLES_PATH':        ':'.join(reversed(ansible_roles_dirs)),
             'ANSIBLE_SSH_PIPELINING':    'yes',
             'ANSIBLE_TIMEOUT':           '120',
         }
+        try:
+            import ara
+            ara_location = os.path.dirname(ara.__file__)
+            ansible_env['ANSIBLE_CALLBACK_PLUGINS'] = (
+                '{ara_location}/plugins/callbacks'
+                .format(ara_location=ara_location))
+            ansible_env['ANSIBLE_ACTION_PLUGINS'] = (
+                '{ara_location}/plugins/actions'
+                .format(ara_location=ara_location))
+            ansible_env['ANSIBLE_LIBRARY'] = (
+                '{ara_location}/plugins/modules'
+                .format(ara_location=ara_location))
+            ara_dir = os.getcwd()
+            ansible_env['ARA_DIR'] = ara_dir
+            ansible_env['ARA_DATABASE'] = (
+                'sqlite:///{ara_dir}/ansible.sqlite'
+                .format(ara_dir=ara_dir))
+            ansible_env['ARA_LOG_FILE'] = (
+                '{ara_dir}/ara.log'
+                .format(ara_dir=ara_dir))
+            ansible_env['ARA_LOG_LEVEL'] = 'DEBUG'
+            ansible_env['ARA_PLAYBOOK_PER_PAGE'] = '0'
+            ansible_env['ARA_RESULT_PER_PAGE'] = '0'
+        except ImportError:
+            elasticluster.log.info(
+                "Could not import module `ara`:"
+                " no detailed information about the playbook will be recorded.")
         # ...override them with key/values set in the config file(s)
         for k, v in self.extra_conf.items():
             if k.startswith('ansible_'):
                 ansible_env[k.upper()] = str(v)
         # ...finally allow the environment have the final word
         ansible_env.update(os.environ)
+        # however, this is needed for correct detection of success/failure
+        ansible_env['ANSIBLE_ANY_ERRORS_FATAL'] = 'yes'
+        # report on calling environment
         if __debug__:
             elasticluster.log.debug(
                 "Calling `ansible-playbook` with the following environment:")
@@ -231,6 +259,7 @@ class AnsibleSetupProvider(AbstractSetupProvider):
         # build `ansible-playbook` command-line
         cmd = shlex.split(self.extra_conf.get('ansible_command', 'ansible-playbook'))
         cmd += [
+            ('--private-key=' + cluster.user_key_private),
             os.path.realpath(self._playbook_path),
             ('--inventory=' + inventory_path),
         ] + list(extra_args)
@@ -256,21 +285,60 @@ class AnsibleSetupProvider(AbstractSetupProvider):
         if ansible_extra_args:
             cmd += shlex.split(ansible_extra_args)
 
-        cmdline = ' '.join(cmd)
-        elasticluster.log.debug("Running Ansible command `%s` ...", cmdline)
-
-        rc = call(cmd, env=ansible_env, bufsize=1, close_fds=True)
-        if rc == 0:
+        with temporary_dir():
+            # adjust execution environment, for the part that needs a
+            # the current directory path
+            cmd += [
+                '-e', 'elasticluster_output_dir={0}'.format(os.getcwd())
+            ]
+            # run it!
+            cmdline = ' '.join(cmd)
+            elasticluster.log.debug(
+                "Running Ansible command `%s` ...", cmdline)
+            rc = call(cmd, env=ansible_env, bufsize=1, close_fds=True)
+            # check outcome
+            ok = False  # pessimistic default
+            if rc != 0:
+                elasticluster.log.error(
+                    "Command `%s` failed with exit code %d.", cmdline, rc)
+            else:
+                # even if Ansible exited with return code 0, the
+                # playbook might still have failed -- so explicitly
+                # check for a "done" report showing that each node run
+                # the playbook until the very last task
+                cluster_hosts = set(node.name
+                                    for node in cluster.get_all_nodes())
+                done_hosts = set()
+                for node_name in cluster_hosts:
+                    try:
+                        with open(node_name + '.log') as stream:
+                            status = stream.read().strip()
+                        if status == 'done':
+                            done_hosts.add(node_name)
+                    except (OSError, IOError):
+                        # no status file for host, do not add it to
+                        # `done_hosts`
+                        pass
+                if done_hosts == cluster_hosts:
+                    # success!
+                    ok = True
+                elif len(done_hosts) == 0:
+                    # total failure
+                    elasticluster.log.error(
+                        "No host reported successfully running the setup playbook!")
+                else:
+                    # partial failure
+                    elasticluster.log.error(
+                        "The following nodes did not report"
+                        " successful termination of the setup playbook:"
+                        " %s", (', '.join(cluster_hosts - done_hosts)))
+        if ok:
             elasticluster.log.info("Cluster correctly configured.")
             return True
         else:
-            elasticluster.log.error(
-                "Command `%s` failed with exit code %d.", cmdline, rc)
-            elasticluster.log.error(
-                "Check the output lines above for additional information on this error.")
-            elasticluster.log.error(
+            elasticluster.log.warning(
                 "The cluster has likely *not* been configured correctly."
-                " You may need to re-run `elasticluster setup` or fix the playbooks.")
+                " You may need to re-run `elasticluster setup`.")
             return False
 
     def _build_inventory(self, cluster):

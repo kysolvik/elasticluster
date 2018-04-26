@@ -9,7 +9,7 @@
 .. _playbooks:
 
 ============================================
-  Playbooks distributed with elasticluster
+  Playbooks distributed with ElastiCluster
 ============================================
 
 ElastiCluster uses `Ansible`_ to configure the VM cluster based on the
@@ -59,10 +59,36 @@ Variable name                      Default             Description
 ``allow_reboot``                   no                  Allow rebooting nodes if needed.  Be careful
                                                        if this is set when resizing clusters, as you
                                                        may lose running jobs.
+``insecure_https_downloads``       no                  If ``no`` (default), require that web sites, from
+                                                       where software is downloaded, present a valid
+                                                       SSL/TLS certificate.  However, it may happen
+                                                       that the base OS trusted certificates repository
+                                                       is not fully up-to-date and this verification fails.
+                                                       (See, for instance, `issue #539 <https://github.com/gc3-uzh-ch/elasticluster/issues/539>`_).
+                                                       In these cases, setting this option to ``yes``
+                                                       allows the playbooks to continue (at the expense
+                                                       of some security).
+
+                                                       .. warning::
+
+                                                          Setting this option to ``yes`` also allows
+                                                          installing packages from *unauthenticated*
+                                                          sources on Debian/Ubuntu.
+
 ``multiuser_cluster``              no                  Install NIS/YP.  The first node in the ``master``
                                                        class will be assigned the role of the YP master
                                                        server; additional nodes in the "master" class
                                                        (if any) will be YP slave servers.
+``ssh_password_auth``              yes                 Allow users to log in via SSH by providing a
+                                                       password. **Note:** the default in ElastiCluster
+                                                       is the opposite of what all major GNU/Linux
+                                                       distributions do.
+``upgrade_packages``               yes                 Upgrade all installed to the latest available
+                                                       version.  Setting this to ``no`` allows speedier
+                                                       setup when starting from cluster snapshots.
+                                                       *Note:* even when set to ``no``, some packages
+                                                       may still be upgraded to satisfy dependencies
+                                                       of other packages that need to be installed.
 ================================== =================== =================================================
 
 
@@ -402,7 +428,8 @@ HTCondor
 
 Tested on:
 
-* Ubuntu 12.04
+* Debian 8.x
+* Ubuntu 14.04
 
 +-------------------+----------------------------------+
 | ansible groups    | role                             |
@@ -410,7 +437,7 @@ Tested on:
 |``condor_master``  | Act as scheduler, submission and |
 |                   | execution host.                  |
 +-------------------+----------------------------------+
-|``condor_workers`` | Act as execution host only.      |
+|``condor_worker``  | Act as execution host only.      |
 +-------------------+----------------------------------+
 
 This playbook will install the `HTCondor`_ workload management system
@@ -423,16 +450,16 @@ compute nodes.
 A *snippet* of a typical configuration for a slurm cluster is::
 
     [cluster/condor]
-    setup_provider=ansible_condor
+    setup_provider=htcondor
     frontend_nodes=1
     compute_nodes=2
     ssh_to=frontend
-    ...
+    # ...
 
-    [setup/ansible_condor]
+    [setup/htcondor]
     frontend_groups=condor_master
-    compute_groups=condor_workers
-    ...
+    compute_groups=condor_worker
+    # ...
 
 
 Kubernetes
@@ -465,6 +492,57 @@ master and 2 worker nodes, and additionally installs flannel for the networking
 
 SSH into the cluster and execute 'sudo kubectl --kubeconfig
 /etc/kubernetes/admin.conf get nodes' to view the cluster.
+
+
+TORQUE
+------
+
+Supported on:
+
+* CentOS 7.x
+* CentOS 6.x
+
++-------------------+----------------------------------+
+| ansible groups    | role                             |
++===================+==================================+
+|``torque_master``  | Act as scheduler, submission and |
+|                   | execution host.                  |
++-------------------+----------------------------------+
+|``torque_worker``  | Act as execution host only.      |
++-------------------+----------------------------------+
+
+This playbook will install the `TORQUE`_ workload management system
+using the packages provided in the EPEL_ repository.
+
+.. note::
+
+   Due to a change in the licensing policy, the last available version
+   in EPEL_ is TORQUE 4.2.10 (released in March 2015) while the latest
+   version (as of this writing, April 2018) is 6.1.2; the cluster
+   installed by ElastiClyuster will thus lack recent features.
+
+   For the same licensing reasons, TORQUE is no longer available in
+   recent Debian and Ubuntu distributionsm and hence cannot currently
+   be installed by ElastiCluster.
+
+The TORQUE server will be configured with a single queue, named
+``default``; all worker nodes will belong to this queue.
+
+The ``/home`` filesystem is exported *from* the ``torque_master`` node
+to the ``torque_worker`` nodes.
+
+A *snippet* of a typical configuration for a slurm cluster is::
+
+    [cluster/torque]
+    setup=torque
+    frontend_nodes=1
+    compute_nodes=4
+    # ...
+
+    [setup/torque]
+    frontend_groups=torque_master
+    compute_groups=torque_worker
+    # ...
 
 
 Filesystems and storage
@@ -805,7 +883,7 @@ The following variables may be set to alter the role behavior:
      - Default value
      - Description
    * - ``anaconda_version``
-     - ``5.0.1``
+     - ``5.1.0``
      - Version of the Anaconda Python distribution to install
    * - ``anaconda_python_version``
      - ``2``

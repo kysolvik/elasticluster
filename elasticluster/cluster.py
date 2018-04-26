@@ -1,6 +1,6 @@
 #! /usr/bin/env python
 #
-# Copyright (C) 2013-2016 S3IT, University of Zurich
+# Copyright (C) 2013-2018 University of Zurich
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -42,6 +42,7 @@ from binascii import hexlify
 from elasticluster import log
 from elasticluster.exceptions import (
     ClusterError,
+    ClusterSizeError,
     ConfigurationError,
     InstanceError,
     InstanceNotFoundError,
@@ -125,10 +126,12 @@ class Cluster(Struct):
     def __init__(self, name, user_key_name='elasticluster-key',
                  user_key_public='~/.ssh/id_rsa.pub',
                  user_key_private='~/.ssh/id_rsa',
-                 cloud_provider=None, setup_provider=None,
+                 cloud_provider=None,
+                 setup_provider=None,
                  repository=None,
                  start_timeout=600,
                  ssh_probe_timeout=5,
+                 ssh_proxy_command='',
                  thread_pool_max_size=10,
                  **extra):
         self.name = name
@@ -136,6 +139,7 @@ class Cluster(Struct):
         self._cloud_provider = cloud_provider
         self._setup_provider = setup_provider
         self.ssh_probe_timeout = ssh_probe_timeout
+        self.ssh_proxy_command = ssh_proxy_command
         self.start_timeout = start_timeout
         self.thread_pool_max_size = thread_pool_max_size
         self.user_key_name = user_key_name
@@ -643,48 +647,20 @@ class Cluster(Struct):
         :raises: ClusterError in case the size does not fit the minimum
                  number specified by the user.
         """
-        # check the total sizes before moving the nodes around
-        minimum_nodes = 0
-        for group, size in min_nodes.items():
-            minimum_nodes = minimum_nodes + size
-
-        if len(self.get_all_nodes()) < minimum_nodes:
-            raise ClusterError("The cluster does not provide the minimum "
-                               "amount of nodes specified in the "
-                               "configuration. The nodes are still running, "
-                               "but will not be setup yet. Please change the"
-                               " minimum amount of nodes in the "
-                               "configuration or try to start a new cluster "
-                               "after checking the cloud provider settings.")
-
         # finding all node groups with an unsatisfied amount of nodes
-        unsatisfied_groups = []
-        for group, size in min_nodes.items():
-            if len(self.nodes[group]) < size:
-                unsatisfied_groups.append(group)
+        unsatisfied = 0
+        for kind, required in min_nodes.iteritems():
+            available = len(self.nodes[kind])
+            if available < required:
+                log.error(
+                    "Not enough nodes of kind `%s`:"
+                    " %d required, but only %d available.",
+                )
+                unsatisfied += 1
 
-        # trying to move nodes around to fill the groups with missing nodes
-        for ugroup in unsatisfied_groups[:]:
-            missing = min_nodes[ugroup] - len(self.nodes[ugroup])
-            for group, nodes in self.nodes.items():
-                spare = len(self.nodes[group]) - min_nodes[group]
-                while spare > 0 and missing > 0:
-                    self.nodes[ugroup].append(self.nodes[group][-1])
-                    del self.nodes[group][-1]
-                    spare -= 1
-                    missing -= 1
+        if unsatisfied:
+            raise ClusterSizeError()
 
-                    if missing == 0:
-                        unsatisfied_groups.remove(ugroup)
-
-        if unsatisfied_groups:
-            raise ClusterError("Could not find an optimal solution to "
-                               "distribute the started nodes into the node "
-                               "groups to satisfy the minimum amount of "
-                               "nodes. Please change the minimum amount of "
-                               "nodes in the configuration or try to start a"
-                               " new clouster after checking the cloud "
-                               "provider settings")
 
     def get_all_nodes(self):
         """Returns a list of all nodes in this cluster as a mixed list of
@@ -1132,7 +1108,8 @@ class Node(Struct):
 
     def __init__(self, name, cluster_name, kind, cloud_provider, user_key_public,
                  user_key_private, user_key_name, image_user, security_group,
-                 image_id, flavor, image_userdata=None, ssh_timeout=5, **extra):
+                 image_id, flavor, image_userdata=None, ssh_proxy_command='',
+                 **extra):
         self.name = name
         self.cluster_name = cluster_name
         self.kind = kind
@@ -1145,7 +1122,7 @@ class Node(Struct):
         self.image_id = image_id
         self.image_userdata = image_userdata
         self.flavor = flavor
-
+        self.ssh_proxy_command = ssh_proxy_command
         self.instance_id = extra.pop('instance_id', None)
         self.preferred_ip = extra.pop('preferred_ip', None)
         self.ips = extra.pop('ips', [])
@@ -1261,39 +1238,96 @@ class Node(Struct):
                 ips.remove(self.preferred_ip)
             else:
                 # Preferred is changed?
-                log.debug("IP %s does not seem to belong to %s anymore. Ignoring!", self.preferred_ip, self.name)
+                log.debug(
+                    "IP address %s does not seem to belong to %s anymore."
+                    " Ignoring it.", self.preferred_ip, self.name)
                 self.preferred_ip = ips[0]
 
         for ip in itertools.chain([self.preferred_ip], ips):
             if not ip:
                 continue
+            log.debug("Trying to connect to host %s (%s) ...", self.name, ip)
             try:
-                log.debug("Trying to connect to host %s (%s)",
-                          self.name, ip)
                 addr, port = parse_ip_address_and_port(ip, SSH_PORT)
-                ssh.connect(str(addr), port=port,
-                            username=self.image_user,
-                            allow_agent=True,
-                            key_filename=self.user_key_private,
-                            timeout=timeout)
-                log.debug("Connection to %s succeeded on port %d!", ip, port)
+                extra = {
+                    'allow_agent':   True,
+                    'key_filename':  self.user_key_private,
+                    'look_for_keys': False,
+                    'timeout':       timeout,
+                    'username':      self.image_user,
+                }
+                if self.ssh_proxy_command:
+                    proxy_command = self.expand_proxy_command(
+                        self.ssh_proxy_command,
+                        self.image_user, addr, port)
+                    from paramiko.proxy import ProxyCommand
+                    extra['sock'] = ProxyCommand(proxy_command)
+                    log.debug("Using proxy command `%s`.", proxy_command)
+                ssh.connect(str(addr), port=port, **extra)
+                log.debug(
+                    "Connection to %s succeeded on port %d,"
+                    " will use this IP address for future connections.",
+                    ip, port)
                 if ip != self.preferred_ip:
-                    log.debug("Setting `preferred_ip` to %s", ip)
                     self.preferred_ip = ip
                 # Connection successful.
                 return ssh
             except socket.error as ex:
                 log.debug(
-                    "Host %s (%s) not reachable within %d seconds: %s.",
-                    self.name, ip, timeout, ex)
+                    "Host %s (%s) not reachable within %d seconds: %s -- %r",
+                    self.name, ip, timeout, ex, type(ex))
             except paramiko.BadHostKeyException as ex:
-                log.error("Invalid host key: host %s (%s); check keyfile: %s",
-                          self.name, ip, keyfile)
+                log.error(
+                    "Invalid SSH host key for %s (%s): %s.",
+                    self.name, ip, ex)
             except paramiko.SSHException as ex:
-                log.debug("Ignoring error %s connecting to %s",
-                          str(ex), self.name)
+                log.debug(
+                    "Ignoring error connecting to %s: %s -- %r",
+                    self.name, ex, type(ex))
 
         return None
+
+    @staticmethod
+    def expand_proxy_command(command, user, addr, port=22):
+        """
+        Expand spacial digraphs ``%h``, ``%p``, and ``%r``.
+
+        Return a copy of `command` with the following string
+        substitutions applied:
+
+        * ``%h`` is replaced by *addr*
+        * ``%p`` is replaced by *port*
+        * ``%r`` is replaced by *user*
+        * ``%%`` is replaced by ``%``.
+
+        See also: man page ``ssh_config``, section "TOKENS".
+        """
+        translated = []
+        subst = {
+            'h': list(str(addr)),
+            'p': list(str(port)),
+            'r': list(str(user)),
+            '%': ['%'],
+        }
+        escaped = False
+        for char in command:
+            if char == '%':
+                escaped = True
+                continue
+            if escaped:
+               try:
+                   translated.extend(subst[char])
+                   escaped = False
+                   continue
+               except KeyError:
+                   raise ValueError(
+                       "Unknown digraph `%{0}`"
+                       " in proxy command string `{1}`"
+                       .format(char, command))
+            else:
+                translated.append(char)
+                continue
+        return str.join('', translated)
 
     def update_ips(self):
         """Retrieves the public and private ip of the instance by using the

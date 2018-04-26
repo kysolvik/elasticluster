@@ -57,6 +57,7 @@ from elasticluster.cluster import Cluster, NodeNamingPolicy
 from elasticluster.repository import MultiDiskRepository
 from elasticluster.utils import environment
 from elasticluster.validate import (
+    alert,
     boolean,
     executable_file,
     existing_file,
@@ -106,7 +107,7 @@ SCHEMA = {
                 'flavor': nonempty_str,
                 'image_id': nonempty_str,
                 Optional('image_userdata', default=''): str,
-                'security_group': str,  ## FIXME: alphanumeric?
+                Optional('security_group', default='default'): str,  ## FIXME: alphanumeric?
                 Optional('network_ids'): str,
                 # these are auto-generated but already there by the time
                 # validation is run
@@ -117,18 +118,19 @@ SCHEMA = {
                 Optional("accelerator_count", default=0): nonnegative_int,
                 Optional("accelerator_type"): nonempty_str,
                 Optional("min_cpu_platform"): nonempty_str,
-                # allow other keys w/out restrictions
+                # allow other string keys w/out restrictions
                 Optional(str): str,
             },
         },
         Optional("ssh_probe_timeout", default=5): positive_int,
+        Optional("ssh_proxy_command", default=''): str,
         Optional("start_timeout", default=600): positive_int,
         # only on Google Cloud
         Optional("accelerator_count", default=0): nonnegative_int,
         Optional("accelerator_type"): nonempty_str,
         Optional("allow_project_ssh_keys", default=True): boolean,
         Optional("min_cpu_platform"): nonempty_str,
-        # allow other keys w/out restrictions
+        # allow other string keys w/out restrictions
         Optional(str): str,
     },
     'login': {
@@ -162,9 +164,19 @@ SCHEMA = {
 CLOUD_PROVIDER_SCHEMAS = {
     'azure': {
         "provider": 'azure',
-        "subscription_id": nonempty_str,
-        "certificate": nonempty_str,
-        Optional("wait_timeout", default=600): positive_int,
+        Optional("subscription_id", default=os.getenv('AZURE_SUBSCRIPTION_ID', '')): nonempty_str,
+        Optional("tenant_id", default=os.getenv('AZURE_TENANT_ID', '')): nonempty_str,
+        Optional("client_id", default=os.getenv('AZURE_CLIENT_ID', '')): nonempty_str,
+        Optional("secret", default=os.getenv('AZURE_CLIENT_SECRET', '')): nonempty_str,
+        Optional("location", default="westus"): nonempty_str,
+        Optional("certificate"): alert(
+            "The `certificate` setting is no longer valid"
+            " in the Azure configuration."
+            " Please remove it from your configuration file."),
+        Optional("wait_timeout"): alert(
+            "The `wait_timeout` setting is no longer valid"
+            " in the Azure configuration."
+            " Please remove it from your configuration file."),
     },
 
     'ec2_boto': {
@@ -655,6 +667,7 @@ def _gather_node_kind_info(kind_name, cluster_name, cluster_conf):
             'network_ids',
             'security_group',
             'node_name',
+            'ssh_proxy_command',
             # Google Cloud only
             'accelerator_count',
             'accelerator_type',
@@ -1081,9 +1094,13 @@ class Creator(object):
 
     _RENAMED_NODE_GROUPS = {
         # old name     ->  (new name             will be removed in...
+        'condor_workers':  ('condor_worker',     '1.4'),
         'gluster_client':  ('glusterfs_client',  '1.4'),
         'gluster_data' :   ('glusterfs_server',  '1.4'),
         'gridengine_clients': ('gridengine_worker', '2.0'),
+        'maui_master':     ('torque_master',     '2.0'),
+        'pbs_clients':     ('torque_worker',     '2.0'),
+        'pbs_master':      ('torque_master',     '2.0'),
         'slurm_clients':   ('slurm_worker',      '2.0'),
         'slurm_workers':   ('slurm_worker',      '1.4'),
     }
